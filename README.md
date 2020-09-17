@@ -42,6 +42,7 @@ Known bugs:
 ## Tested Cameras
 
 - Canon EOS Rebel T3i
+- Canon EOS M50
 
 
 ## Desired features/"roadmap I may or may not ever get to"

@@ -1,231 +1,415 @@
 #!/usr/bin/env ruby
 require 'gphoto2'
 require 'tty-prompt'
+require 'tty-spinner'
+require 'optparse'
 
-VIDEO_DEVICE='/dev/video9'
-
-Thread.abort_on_exception = false
-
-$selected_camera = nil
-$prompt = TTY::Prompt.new( quiet: true, interrupt: :noop )
-$capture_thread = nil
-$in_queue = Queue.new
-$out_queue = Queue.new
-
-# the meat'n'potatoes; this will be started in a new thread automatically
-# spawns ffmpeg, starts a capture, and listens on $in_queue for commands
 #
-def bind_and_capture()
-    pipe_r, pipe_w = IO.pipe
-    spawn( *%w[ffmpeg -hide_banner -loglevel quiet -i - -vcodec rawvideo -pix_fmt yuv420p -threads 0 -f v4l2], VIDEO_DEVICE, in: pipe_r )
-    loop do
-        # read a preview image and send it off to ffmpeg
-        begin
-            pipe_w.write( $selected_camera.preview.data )
-        rescue
-            $out_queue.push 'abort'
-            break
-        end
+class CameraCapture
 
-        # attempt to load/run a new task
-        action, data = begin
-            item = $in_queue.pop( true )
-            if item.is_a?( Array )
-                item
-            else
-                # no data
-                [ item, nil ]
+    # the default v4l2 output device, written to by ffmpeg.
+    DEFAULT_OUTPUT_DEVICE='/dev/video9'
+
+
+    # Initialize the app
+    #
+    def initialize( **options )
+        Thread.abort_on_exception = false
+        @prompt = TTY::Prompt.new( quiet: true, interrupt: :noop )
+        @command_queue = Queue.new
+        @result_queue = Queue.new
+
+        @output_device = options.fetch( :output_device ){ DEFAULT_OUTPUT_DEVICE }
+        @wait_for_camera = options.fetch( :wait_for_camera ){ false }
+    end
+
+ 
+    # the TTY::Prompt object
+    attr_accessor :prompt
+
+    # the selected GPhoto2::Camera
+    attr_accessor :selected_camera
+
+    # the handle for the video capture/gphoto2 thread
+    attr_accessor :capture_thread
+
+    # the handle for the intermediary/oob thread
+    attr_accessor :interface_thread
+
+    # the queue for sending data into the capture thread
+    attr_accessor :command_queue
+
+    # the queue for getting data out of the capture thread
+    attr_accessor :result_queue
+
+    # the selected v4l2 output device
+    attr_accessor :output_device
+
+
+    # run the program
+    #
+    def run
+        self.check_v4l2
+        self.select_camera
+        self.run_interface_thread
+        self.menu_main
+    end
+
+
+    #########
+    protected
+    #########
+  
+
+    ##############################################
+    # C A M E R A  F U N C T I O N S 
+    ##############################################
+
+    # find a camera to use
+    #
+    def select_camera
+        spinner = TTY::Spinner.new( ':spinner :title', clear: true )
+        spinner.update( title: "Collecting camera info.." )
+        spinner.auto_spin
+
+        # run in a thread so the spinner spins
+        Thread.new {
+            cameras = GPhoto2::Camera.all
+
+            # wait for a camera, if requested
+            if @wait_for_camera && cameras.empty?
+                spinner.update( title: "Waiting for a camera.." )
+
+                loop do
+                    cameras = GPhoto2::Camera.all
+                    break unless cameras.empty?
+                    sleep 0.5
+                end
             end
-        rescue
-            [ nil, nil ]
+
+            case cameras.length
+            when 0
+                spinner.stop
+                puts "No cameras found; did you turn it on?"
+                exit 2
+            when 1
+                self.selected_camera = cameras.first
+                self.selected_camera.reload
+                spinner.stop
+            else
+                choices = cameras.each_with_object( {} ) do |c,acc|
+                        acc.merge!({ c['cameramodel'] => c })
+                    end
+                choices.merge!( { "Exit" => "exit" } )
+                spinner.stop
+
+                self.selected_camera = self.prompt.select(
+                    "Which camera?",
+                    choices
+                )
+                exit 0 if self.selected_camera == "exit"
+            end
+        }.join
+    end
+
+
+    ##############################################
+    # T H R E A D  F U N C T I O N S 
+    ##############################################
+
+    # run the middleman thread that makes sure our capture keeps going, etc
+    # this will start the capture thread for us.
+    #
+    def run_interface_thread
+        self.interface_thread = Thread.new do
+            loop do
+                unless self.capture_thread && self.capture_thread.alive?
+                    # if the thread died with a message on the bus, make sure
+                    # it's not meant to end the program
+                    item = self.result( fail_ok: true )
+                    if item && item.first == "abort"
+                        print TTY::Cursor.clear_lines(10, :down)
+                        self.prompt.say "Abort: camera disconnected? (%s)" % [ item.last ]
+                        exit 3
+                    end
+
+                    # otherwise, just (re)start it.
+                    self.capture_thread = Thread.new{ self.run_capture_thread }
+                end
+                sleep 0.5
+            end
         end
+    end
 
-        case action
-            when 'autofocusdrive'
-                $selected_camera.update( autofocusdrive: 1 )
-                #$selected_camera.update( eosremoterelease: "Press Half" )
-                #$selected_camera.update( eosremoterelease: "Release Full" )
-                #$selected_camera.update( autofocusdrive: 0 )
-                #$selected_camera.update( eosremoterelease: "None" )
 
-            when 'cancelautofocus'
-                # i honestly have no idea what it's doing, or what i'm doing
-                $selected_camera.update( autofocusdrive: 0 )
-                $selected_camera.update( cancelautofocus: 1 )
-                $selected_camera.update( cancelautofocus: 0 )
+    # the meat'n'potatoes; this will be started in a new thread automatically
+    # spawns ffmpeg, starts a capture, and listens on $in_queue for commands
+    #
+    def run_capture_thread
+        io = IO.popen( self.ffmpeg_cmdline, "w" ) do |ffmpeg_io|
+            loop do
+                # read a preview image and send it off to ffmpeg
+                ffmpeg_io.write( self.selected_camera.preview.data )
 
-            when 'manualfocusdrive'
-                $selected_camera.update( manualfocusdrive: data )
-                $selected_camera.update( manualfocusdrive: "None" )
-
-            when 'getconfig'
-                node,func = data.split( ":" )
-                if node && func
-                    $out_queue.push( $selected_camera.config[ node ].send( func.to_sym ) )
-                else
-                    $out_queue.push( $selected_camera.config )
+                # attempt to load/run a new task
+                action, data = begin
+                    self.command_queue.pop( true )
+                rescue
+                    [ nil, nil ]
                 end
 
-            when 'update'
-                node,value = data.split(":")
-                $selected_camera.update( node.to_sym => value ) rescue nil
+                case action
+                    when 'autofocusdrive'
+                        self.selected_camera.update( autofocusdrive: 1 )
+                        #self.selected_camera.update( eosremoterelease: "Press Half" )
+                        #self.selected_camera.update( eosremoterelease: "Release Full" )
+                        #self.selected_camera.update( autofocusdrive: 0 )
+                        #self.selected_camera.update( eosremoterelease: "None" )
 
-            when 'exit'
-                $out_queue.push 'bye'
-                break
-        end
-    end
-ensure
-    $selected_camera.exit
-end
+                    when 'cancelautofocus'
+                        # i honestly have no idea what it's doing, or what i'm doing
+                        self.selected_camera.update( autofocusdrive: 0 )
+                        self.selected_camera.update( cancelautofocus: 1 )
+                        self.selected_camera.update( cancelautofocus: 0 )
 
+                    when 'manualfocusdrive'
+                        self.selected_camera.update( manualfocusdrive: data )
+                        self.selected_camera.update( manualfocusdrive: "None" )
 
-# automatically create a 'select' menu for a config (shutterspeed, apeture, etc..)
-#
-def config_select_menu( configname, configtitle ) 
-    # get valid & current values
-    $in_queue.push [ 'getconfig', '%s:choices' % [configname] ]
-    values = $out_queue.pop
-    values << "Back to main menu"
-
-    loop do
-        $in_queue.push [ 'getconfig', '%s:value' % [configname] ]
-        current = $out_queue.pop
-
-        selected = $prompt.select( "Select %s." % [configtitle], values, default: values.find_index( current )+1, per_page: 15, filter: true )
-        break if selected =~ /^Back/
-
-        $in_queue.push [ 'update', '%s:%s' % [ configname, selected ] ]
-    end
-end
-
-
-# make sure the v4l2 device is loaded
-#
-unless File.exist?( VIDEO_DEVICE )
-    puts "No such file: %s - is v4l2loopback loaded?"
-    exit 1
-end
-
-
-# find a camera to use
-#
-cameras = GPhoto2::Camera.all
-case cameras.length
-when 0
-    puts "No cameras found; did you turn it on?"
-    exit 2
-when 1
-    $selected_camera = cameras.first
-else
-    $selected_camera = $prompt.select(
-        "Which camera?",
-        cameras.each_with_object( {} ) do |c,acc|
-            acc.merge!({ c.model => c })
-        end
-    )
-end
-
-
-# set up the main menu
-#
-main_menu = [
-                { name: "Autofocus", value: Proc.new do
-                        $in_queue.push "autofocusdrive"
-                    end
-                },
-                { name: "Cancel Autofocus", value: Proc.new do
-                        $in_queue.push "cancelautofocus"
-                    end
-                },
-                { name: "Manual Focus", value: Proc.new do
-                        last_selection = "None"
-
-                        # cancel auto focus first to regain control
-                        $in_queue.push [ 'getconfig', 'autofocusdrive:value' ]
-                        if $out_queue.pop
-                            $in_queue.push 'cancelautofocus'
+                    when 'getconfig'
+                        node,func = data.split( ":" )
+                        if node && func
+                            self.result_queue.push( [ self.selected_camera.config[ node ].send( func.to_sym ) ] )
+                        else
+                            self.result_queue.push( [ self.selected_camera.config ] )
                         end
-                        
-                        # grab the focus types
-                        $in_queue.push [ 'getconfig', 'manualfocusdrive:choices' ]
-                        focus_modes = $out_queue.pop
 
-                        # we want to sort near 3..1, none, far 1..3
-                        focus_modes.sort_by!{|n|
-                            weight = 0
-                            if n != "None"
-                                type,amt = n.split(' ')
-                                weight = weight + ( type == "Near" ? amt.to_i*-1 : amt.to_i )
-                            end
+                    when 'update'
+                        node,value = data.split(":")
+                        self.selected_camera.update( node.to_sym => value ) rescue nil
 
-                            weight
-                        }
+                    when 'exit'
+                        self.result_queue.push [ 'bye' ]
+                        break
+                end
 
-                        # then sub the numbers with plus signs
-                        focus_modes = focus_modes.map{|n|
-                            type,amt = n.split(' ')
-                            if amt
-                                {name: "%s %s" % [ type, "+"*amt.to_i ], value: n}
-                            else
-                                {name: n, value: n}
-                            end
-                        }
-
-                        focus_modes << "Back to main menu"
-
-                        loop do
-                            selected = $prompt.select(
-                                "Select a focus adjustment",
-                                focus_modes,
-                                per_page: 10,
-                                default: focus_modes.find_index{|n| n[:value] == last_selection }+1
-                            )
-                            break if selected =~ /^Back/
-                            $in_queue.push( [ 'manualfocusdrive', selected ] )
-                            last_selection = selected
-                        end
-                    end
-                }, 
-                { name: "Adjust Aperture", value: Proc.new{ config_select_menu( 'aperture', 'an aperture value.') } },
-                { name: "Adjust Shutter Speed", value: Proc.new{ config_select_menu( 'shutterspeed', 'a shutter speed.' ) } },
-                { name: "Send gphoto2 config", value: Proc.new{
-                        cmd = $prompt.ask "Enter a gphoto2 config like \"node_name:value\". Enter an empty line to cancel.\n>"
-                        $in_queue.push [ 'update', cmd ] if cmd
-                    }
-                },
-                { name: "Restart capture", value: Proc.new{
-                        $in_queue.push 'exit'
-                        $out_queue.pop
-                    }
-                },
-                { name: "Exit", value: Proc.new{ $capture_thread.kill;exit 0 } }
-          ]
-
-
-# the thread-starting thread, and also out-of-band handler
-#
-Thread.new { 
-    loop do
-        unless $capture_thread && $capture_thread.alive?
-            # if the thread died with a message on the bus, make sure
-            # it's not meant to end the program
-            item = $out_queue.pop(true) rescue nil
-            if item && item == "abort"
-                print TTY::Cursor.clear_lines(10, :down)
-                $prompt.say "Abort: camera disconnected?"
-                exit 3
             end
-            $capture_thread = Thread.new{ bind_and_capture() }
+
+        rescue Errno::EPIPE
+            # ffmpeg crash
+            self.result_queue.push( [ 'restart_pipe' ] ) rescue nil
+
+        rescue GPhoto2::Error => e
+            self.result_queue.push( [ 'abort', e.message ] ) rescue nil
+
+        end # io.popen
+
+    ensure
+        # signal a close to gphoto and kill ffmpeg
+        self.selected_camera.exit
+
+        pstatus = Process.kill(0, ffmpeg_io.pid ) rescue nil
+        if pstatus
+            Process.kill( 9, ffmpeg_io.pid )
+            Process.waitpid ffmpeg_io.pid
         end
-        sleep 0.5
     end
-}
 
 
-# "main loop" style, woo.
-#
-loop do
-    $prompt.select( "Camera Capture", main_menu, enum: '.', per_page: 10)
+    ##############################################
+    # V I D E O  F U N C T I O N S 
+    ##############################################
+
+    # make sure the v4l2 device is loaded
+    #
+    def check_v4l2
+        unless File.exist?( self.output_device )
+            puts "No such file: %s - is v4l2loopback loaded?"
+            exit 1
+        end
+    end
+
+
+    # The command used to run ffmpeg, which ingests the preview frames from the camera.
+    # TODO: flesh out the ffmpeg customization.
+    #
+    def ffmpeg_cmdline
+        return "ffmpeg -hide_banner -loglevel quiet -i - -vcodec rawvideo -pix_fmt yuv420p -vf scale=w=1920:h=1280:force_original_aspect_ratio=decrease -threads 0 -f v4l2 %s" % [
+                self.output_device
+            ]
+    end
+
+
+    ##############################################
+    # D A T A  Q U E U E  F U N C T I O N S 
+    ##############################################
+
+    # send a command to the processing thread, optionally
+    # waiting for and returning a result inline
+    #
+    def command( c, arg: nil, wait_for_result: false, fail_ok: false )
+        cr = self.command_queue.push( [ c, arg ].flatten )
+
+        return self.result( fail_ok: fail_ok ) if wait_for_result
+        return cr
+    end
+
+
+    # get a result from the queue, optionally allowing for failures
+    # (i.e. empty queue)
+    #
+    def result( fail_ok:false )
+        begin
+            return self.result_queue.pop( fail_ok )
+        rescue => e
+            # re-raise if fail_ok=>false
+            raise e unless fail_ok
+            return nil
+        end
+    end
+
+
+    ##############################################
+    # M E N U  F U N C T I O N S 
+    ##############################################
+
+    # run the main menu in an infinite loop, until exited.
+    #
+    def menu_main
+        main_menu = [
+            { name: "Autofocus", value: -> { self.command( 'autofocusdrive' ) } },
+            { name: "Cancel Autofocus", value: -> { self.command( 'cancelautofocus' ) } },
+            { name: "Manual Focus", value: -> { self.menu_manualfocus } }, 
+            { name: "Adjust Aperture", value: -> { self.menu_config_select( 'aperture', 'an aperture value.' ) } },
+            { name: "Adjust Shutter Speed", value: -> { self.menu_config_select( 'shutterspeed', 'a shutter speed.' ) } },
+            { name: "Send gphoto2 config", value: Proc.new{
+                    cmd = self.prompt.ask "Enter a gphoto2 config like \"node_name:value\". Enter an empty line to cancel.\n>"
+                    self.command( 'update', arg: cmd ) if cmd
+                }
+            },
+            { name: "Restart capture", value: -> { self.command( 'exit', wait_for_result: true ) } },
+            { name: "Exit", value: -> { self.interface_thread.kill;self.interface_thread.join;self.capture_thread.kill;exit 0 } }
+          ]
+        
+        # TODO: find a way to a) return to the last selected item when coming back to the main menu, and
+        # TODO: b) be able to hit 'q' or 'esc' to exit the menu (and the program).
+        loop do
+            selected = self.prompt.select( "Camera Capture", main_menu, enum: '.', per_page: 10 )
+        end
+    end
+
+
+    # automatically create a 'select' menu for a config (shutterspeed, apeture, etc..)
+    #
+    def menu_config_select( configname, configtitle ) 
+        # get valid & current values
+        values = self.command( 'getconfig', arg: '%s:choices' % [configname], wait_for_result: true ).first
+        values << "Back to main menu"
+
+        loop do
+            current = self.command( 'getconfig', arg: '%s:value' % [configname], wait_for_result: true ).first
+
+            selected = self.prompt.select( "Select %s." % [configtitle], values, default: values.find_index( current )+1, per_page: 15, filter: true )
+            break if selected =~ /^Back/
+
+            self.command( 'update', arg: '%s:%s' % [ configname, selected ] )
+        end
+    end
+
+
+    # automatically create a 'slider' menu for a config (shutterspeed, apeture, etc..)
+    # note: this isn't currently working, and is pending a pull request in tty-prompt
+    #
+    def menu_config_slider( configname, configtitle ) 
+        # get valid & current values
+        values = self.command( 'getconfig', arg: '%s:choices' % [configname], wait_for_result: true ).first
+        values << "Back to main menu"
+
+        loop do
+            current = self.command( 'getconfig', arg: '%s:value' % [configname], wait_for_result: true ).first
+
+            selected = self.prompt.slider( "Select %s." % [configtitle], values: values, default: values.find_index( current )+1 )
+            break if selected =~ /^Back/
+
+            self.command( 'update', arg: '%s:%s' % [ configname, selected ] )
+        end
+    end
+
+
+    # the menu for adjusting the focus manually
+    #
+    def menu_manualfocus
+        last_selection = "None"
+
+        # cancel auto focus first to regain control
+        af_status = self.command( 'getconfig', arg: 'autofocusdrive:value', wait_for_result: true ).first
+        if af_status
+            self.command( 'cancelautofocus' )
+        end
+        
+        # grab the focus types
+        focus_modes = self.command( 'getconfig', arg: 'manualfocusdrive:choices', wait_for_result: true ).first
+
+        # we want to sort near 3..1, none, far 1..3
+        focus_modes.sort_by!{|n|
+            weight = 0
+            if n != "None"
+                type,amt = n.split(' ')
+                weight = weight + ( type == "Near" ? amt.to_i*-1 : amt.to_i )
+            end
+
+            weight
+        }
+
+        # then sub the numbers with plus signs
+        focus_modes = focus_modes.map{|n|
+           type,amt = n.split(' ')
+            if amt
+                {name: "%s %s" % [ type, "+"*amt.to_i ], value: n}
+            else
+                {name: n, value: n}
+            end
+        }
+
+        focus_modes << "Back to main menu"
+
+        loop do
+            selected = self.prompt.select(
+                "Select a focus adjustment",
+                focus_modes,
+                per_page: 10,
+                default: focus_modes.find_index{|n| n[:value] == last_selection }+1
+            )
+            break if selected =~ /^Back/
+            self.command( 'manualfocusdrive', arg: selected )
+            last_selection = selected
+        end
+    end
+
 end
+
+
+# gather commandline options
+options = {}
+OptionParser.new do |opts|
+    opts.banner = "Usage: #{ARGV[0]} [options]"
+
+    opts.on( '-dDEVICE', '--device=DEVICE', "The v4l2 device to output to.") do |d|
+        options[ :output_device ] = d
+    end
+
+    opts.on( '-w', '--[no-]wait', "Wait for a camera to be connected.") do |w|
+        options[ :wait_for_camera ] = w
+    end
+
+    opts.on( '-h', '--help', "Print this help.") do |h|
+        puts opts
+        exit 0
+    end
+end.parse!
+
+
+# run!
+app = CameraCapture.new( **options )
+app.run
 
