@@ -1,5 +1,7 @@
 # camera-capture
 
+![demo](demo.gif)
+
 ## What is this?
 
 A small script to assist with using a DSLR camera as a webcam, using gphoto2, ffmpeg, and v4l2loopback.
@@ -15,10 +17,11 @@ which comes in handy with changing lighting conditions and focus needs.
 
 Install the needed gems, and run it:
 
-    gem install gphoto2 tty-prompt
+    gem install gphoto2 tty-prompt tty-spinner
     ./camera-capture
 
 Written for ruby 2.7, but will probably work with as far back as 2.4 - untested, however.
+
 
 ## What can I/can't I do with it?
 
