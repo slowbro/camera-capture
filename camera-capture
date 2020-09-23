@@ -1,5 +1,6 @@
 #!/usr/bin/env ruby
 require 'gphoto2'
+require 'rmagick'
 require 'tty-prompt'
 require 'tty-spinner'
 require 'optparse'
@@ -19,11 +20,16 @@ class CameraCapture
         @command_queue = Queue.new
         @result_queue = Queue.new
 
-        @output_device = options.fetch( :output_device ){ DEFAULT_OUTPUT_DEVICE }
-        @wait_for_camera = options.fetch( :wait_for_camera ){ false }
+        # commandline args
+        @output_device               = options.fetch( :output_device ){ DEFAULT_OUTPUT_DEVICE }
+        @output_geometry_width       = options.fetch( :output_geometry_w ){ 1920 }
+        @output_geometry_height      = options.fetch( :output_geometry_h ){ 1280 }
+        @output_geometry_aspect      = Rational( @output_geometry_width, @output_geometry_height )
+        @output_geometry_keep_aspect = options.fetch( :output_geometry_keep_aspect ){ true }
+        @wait_for_camera             = options.fetch( :wait_for_camera ){ false }
     end
 
- 
+
     # the TTY::Prompt object
     attr_accessor :prompt
 
@@ -45,6 +51,17 @@ class CameraCapture
     # the selected v4l2 output device
     attr_accessor :output_device
 
+    # the desired video output geometry
+    attr_accessor :output_geometry_width
+    attr_accessor :output_geometry_height
+    attr_accessor :output_geometry_aspect
+    attr_accessor :output_geometry_keep_aspect
+
+    # the captured video geometry
+    attr_accessor :capture_geometry_width
+    attr_accessor :capture_geometry_height
+    attr_accessor :capture_geometry_aspect
+
 
     # run the program
     #
@@ -59,10 +76,10 @@ class CameraCapture
     #########
     protected
     #########
-  
+
 
     ##############################################
-    # C A M E R A  F U N C T I O N S 
+    # C A M E R A  F U N C T I O N S
     ##############################################
 
     # find a camera to use
@@ -114,7 +131,7 @@ class CameraCapture
 
 
     ##############################################
-    # T H R E A D  F U N C T I O N S 
+    # T H R E A D  F U N C T I O N S
     ##############################################
 
     # run the middleman thread that makes sure our capture keeps going, etc
@@ -146,6 +163,12 @@ class CameraCapture
     # spawns ffmpeg, starts a capture, and listens on $in_queue for commands
     #
     def run_capture_thread
+        # capture a trial frame so we can get details about the camera's output
+        image = Magick::Image.from_blob( self.selected_camera.preview.data ).first
+        self.capture_geometry_width  = image.columns
+        self.capture_geometry_height = image.rows
+        self.capture_geometry_aspect = Rational( image.columns, image.rows )
+
         io = IO.popen( self.ffmpeg_cmdline, "w" ) do |ffmpeg_io|
             loop do
                 # read a preview image and send it off to ffmpeg
@@ -192,32 +215,30 @@ class CameraCapture
                         self.result_queue.push [ 'bye' ]
                         break
                 end
+            end # loop
+        end # io
 
-            end
+    rescue Errno::EPIPE
+        # ffmpeg crash
+        self.result_queue.push( [ 'restart_pipe' ] ) rescue nil
 
-        rescue Errno::EPIPE
-            # ffmpeg crash
-            self.result_queue.push( [ 'restart_pipe' ] ) rescue nil
-
-        rescue GPhoto2::Error => e
-            self.result_queue.push( [ 'abort', e.message ] ) rescue nil
-
-        end # io.popen
+    rescue GPhoto2::Error => e
+        self.result_queue.push( [ 'abort', e.message ] ) rescue nil
 
     ensure
         # signal a close to gphoto and kill ffmpeg
         self.selected_camera.exit
 
-        pstatus = Process.kill(0, ffmpeg_io.pid ) rescue nil
+        pstatus = Process.kill(0, io.pid ) rescue nil
         if pstatus
-            Process.kill( 9, ffmpeg_io.pid )
-            Process.waitpid ffmpeg_io.pid
+            Process.kill( 9, io.pid )
+            Process.waitpid io.pid
         end
     end
 
 
     ##############################################
-    # V I D E O  F U N C T I O N S 
+    # V I D E O  F U N C T I O N S
     ##############################################
 
     # make sure the v4l2 device is loaded
@@ -234,14 +255,19 @@ class CameraCapture
     # TODO: flesh out the ffmpeg customization.
     #
     def ffmpeg_cmdline
-        return "ffmpeg -hide_banner -loglevel quiet -i - -vcodec rawvideo -pix_fmt yuv420p -vf scale=w=1920:h=1280:force_original_aspect_ratio=decrease -threads 0 -f v4l2 %s" % [
+        return "ffmpeg -hide_banner -loglevel quiet -i - -vcodec rawvideo -pix_fmt yuv420p -vf scale=w=%s:h=%s%s -threads 0 -f v4l2 %s" % [
+                self.output_geometry_width,
+                self.output_geometry_height,
+                ( self.output_geometry_keep_aspect && self.output_geometry_aspect != self.capture_geometry_aspect ?
+                    ( self.output_geometry_aspect > self.capture_geometry_aspect ? ':force_original_aspect_ratio=increase' : ':force_original_aspect_ratio=decrease' ) : ''
+                ),
                 self.output_device
             ]
     end
 
 
     ##############################################
-    # D A T A  Q U E U E  F U N C T I O N S 
+    # D A T A  Q U E U E  F U N C T I O N S
     ##############################################
 
     # send a command to the processing thread, optionally
@@ -270,46 +296,66 @@ class CameraCapture
 
 
     ##############################################
-    # M E N U  F U N C T I O N S 
+    # M E N U  F U N C T I O N S
     ##############################################
 
     # run the main menu in an infinite loop, until exited.
     #
     def menu_main
         main_menu = [
-            { name: "Autofocus", value: -> { self.command( 'autofocusdrive' ) } },
-            { name: "Cancel Autofocus", value: -> { self.command( 'cancelautofocus' ) } },
-            { name: "Manual Focus", value: -> { self.menu_manualfocus } }, 
-            { name: "Adjust Aperture", value: -> { self.menu_config_select( 'aperture', 'an aperture value.' ) } },
-            { name: "Adjust Shutter Speed", value: -> { self.menu_config_select( 'shutterspeed', 'a shutter speed.' ) } },
+            { name: "Autofocus", value: -> { self.command( 'autofocusdrive' ); 1 } },
+            { name: "Cancel Autofocus", value: -> { self.command( 'cancelautofocus' ); 2 } },
+            { name: "Manual Focus", value: -> { self.menu_manualfocus; 3 } },
+            { name: "Adjust Aperture", value: -> {
+                    self.menu_config_select( 'aperture', 'an aperture value.' ) do |values|
+                        pretty = values.map{|v| "f/%s" % [ v ] }
+
+                        [ values, pretty ]
+                    end
+                    4
+                } },
+            { name: "Adjust Shutter Speed", value: -> { self.menu_config_select( 'shutterspeed', 'a shutter speed.' ); 5 } },
             { name: "Send gphoto2 config", value: Proc.new{
                     cmd = self.prompt.ask "Enter a gphoto2 config like \"node_name:value\". Enter an empty line to cancel.\n>"
                     self.command( 'update', arg: cmd ) if cmd
+                    6
                 }
             },
-            { name: "Restart capture", value: -> { self.command( 'exit', wait_for_result: true ) } },
+            { name: "Restart capture", value: -> { self.command( 'exit', wait_for_result: true ); 8} },
             { name: "Exit", value: -> { self.interface_thread.kill;self.interface_thread.join;self.capture_thread.kill;exit 0 } }
           ]
-        
-        # TODO: find a way to a) return to the last selected item when coming back to the main menu, and
-        # TODO: b) be able to hit 'q' or 'esc' to exit the menu (and the program).
+
+        # TODO: find a way to be able to hit 'q' or 'esc' to exit the menu (and the program).
+        selected = 1
         loop do
-            selected = self.prompt.select( "Camera Capture", main_menu, enum: '.', per_page: 10 )
+            selected = self.prompt.select( "Camera Capture", main_menu, enum: '.', per_page: 10, default: selected )
         end
     end
 
 
     # automatically create a 'select' menu for a config (shutterspeed, apeture, etc..)
     #
-    def menu_config_select( configname, configtitle ) 
+    def menu_config_select( configname, configtitle, &block )
         # get valid & current values
         values = self.command( 'getconfig', arg: '%s:choices' % [configname], wait_for_result: true ).first
-        values << "Back to main menu"
+        pretty_values = values
+
+        # if a block was given, use it to sort/translate/etc the values
+        # otherwise, just use the values as-is
+        values, pretty_values = block.call( values ) if block_given?
+
+        choices = values.each_with_object( [] ).with_index do |(val, acc), idx|
+            acc << { name: pretty_values[ idx ], value: val }
+        end
+
+        # add the "exit" option
+        choices << { name: "Back to main menu", value: "Back to main menu" }
 
         loop do
             current = self.command( 'getconfig', arg: '%s:value' % [configname], wait_for_result: true ).first
+            default = choices.find_index{|c| c[ :value ] == current } + 1
 
-            selected = self.prompt.select( "Select %s." % [configtitle], values, default: values.find_index( current )+1, per_page: 15, filter: true )
+            selected = self.prompt.select( "Select %s." % [configtitle], choices, default: default, per_page: 15, filter: true )
             break if selected =~ /^Back/
 
             self.command( 'update', arg: '%s:%s' % [ configname, selected ] )
@@ -318,18 +364,30 @@ class CameraCapture
 
 
     # automatically create a 'slider' menu for a config (shutterspeed, apeture, etc..)
-    # note: this isn't currently working, and is pending a pull request in tty-prompt
+    # note: this isn't currently working, and is pending the next release (>0.22) of tty-prompt
     #
-    def menu_config_slider( configname, configtitle ) 
+    def menu_config_slider( configname, configtitle )
         # get valid & current values
         values = self.command( 'getconfig', arg: '%s:choices' % [configname], wait_for_result: true ).first
-        values << "Back to main menu"
+        pretty_values = values
+
+        # if a block was given, use it to sort/translate/etc the values
+        # otherwise, just use the values as-is
+        values, pretty_values = block.call( values ) if block_given?
+
+        choices = values.each_with_object( [] ).with_index do |(val, acc), idx|
+            acc << { name: pretty_values[ idx ], value: val }
+        end
+
+        # add the "exit" option
+        choices << { name: "Exit", value: "Exit" }
 
         loop do
             current = self.command( 'getconfig', arg: '%s:value' % [configname], wait_for_result: true ).first
+            default = choices.find_index{|c| c[ :value ] == current } + 1
 
-            selected = self.prompt.slider( "Select %s." % [configtitle], values: values, default: values.find_index( current )+1 )
-            break if selected =~ /^Back/
+            selected = self.prompt.slider( "Select %s." % [configtitle], choices, default: default )
+            break if selected == "Exit"
 
             self.command( 'update', arg: '%s:%s' % [ configname, selected ] )
         end
@@ -346,7 +404,7 @@ class CameraCapture
         if af_status
             self.command( 'cancelautofocus' )
         end
-        
+
         # grab the focus types
         focus_modes = self.command( 'getconfig', arg: 'manualfocusdrive:choices', wait_for_result: true ).first
 
@@ -394,12 +452,24 @@ options = {}
 OptionParser.new do |opts|
     opts.banner = "Usage: #{ARGV[0]} [options]"
 
-    opts.on( '-dDEVICE', '--device=DEVICE', "The v4l2 device to output to.") do |d|
+    opts.on( '-dDEVICE', '--device=DEVICE', "The v4l2 device to output to. (default: video9)") do |d|
         options[ :output_device ] = d
     end
 
-    opts.on( '-w', '--[no-]wait', "Wait for a camera to be connected.") do |w|
+    opts.on( '-w', '--[no-]wait', "Wait for a camera to be connected. (default: no-wait)") do |w|
         options[ :wait_for_camera ] = w
+    end
+
+    opts.on( '-g', '--geometry=WxH', "Specify the output video geometry. (default: 1920x1280)") do |g|
+        matches = /^(?<w>\d+)[xX:](?<h>\d+)$/.match( g )
+        raise ArgumentError, "Invalid geometry: %s" % [ g ] unless matches
+
+        options[ :output_geometry_w ] = matches[ :w ]
+        options[ :output_geometry_h ] = matches[ :h ]
+    end
+
+    opts.on( '--[no-]keep-aspect-ratio', "Perserve the aspect ratio of the captured video in the output stream. (default: true)" ) do |k|
+        options[ :output_geometry_keep_aspect ] = k
     end
 
     opts.on( '-h', '--help', "Print this help.") do |h|
