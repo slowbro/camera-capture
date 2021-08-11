@@ -303,32 +303,32 @@ class CameraCapture
     #
     def menu_main
         main_menu = [
-            { name: "Autofocus", value: -> { self.command( 'autofocusdrive' ); 1 } },
-            { name: "Cancel Autofocus", value: -> { self.command( 'cancelautofocus' ); 2 } },
-            { name: "Manual Focus", value: -> { self.menu_manualfocus; 3 } },
-            { name: "Adjust Aperture", value: -> {
-                    self.menu_config_select( 'aperture', 'an aperture value.' ) do |values|
+            { name: "Autofocus", key: 'f',value: -> { self.command( 'autofocusdrive' ); 1 } },
+            { name: "Cancel Autofocus", key: 'c', value: -> { self.command( 'cancelautofocus' ); 2 } },
+            { name: "Manual Focus", key: 'm', value: -> { self.menu_manualfocus; 3 } },
+            { name: "Adjust Aperture", key: 'a', value: -> {
+                    self.menu_config_slider( 'aperture', 'an aperture value.' ) do |values|
                         pretty = values.map{|v| "f/%s" % [ v ] }
 
                         [ values, pretty ]
                     end
                     4
                 } },
-            { name: "Adjust Shutter Speed", value: -> { self.menu_config_select( 'shutterspeed', 'a shutter speed.' ); 5 } },
-            { name: "Send gphoto2 config", value: Proc.new{
+            { name: "Adjust Shutter Speed", key: 's', value: -> { self.menu_config_slider( 'shutterspeed', 'a shutter speed.' ); 5 } },
+            { name: "Adjust ISO", key: 'i', value: -> { self.menu_config_slider( 'iso', 'an ISO.' ); 6 } },
+            { name: "Send gphoto2 config", key: 'g', value: Proc.new{
                     cmd = self.prompt.ask "Enter a gphoto2 config like \"node_name:value\". Enter an empty line to cancel.\n>"
                     self.command( 'update', arg: cmd ) if cmd
-                    6
+                    7
                 }
             },
-            { name: "Restart capture", value: -> { self.command( 'exit', wait_for_result: true ); 8} },
-            { name: "Exit", value: -> { self.interface_thread.kill;self.interface_thread.join;self.capture_thread.kill;exit 0 } }
+            { name: "Restart capture", key: "r", value: -> { self.command( 'exit', wait_for_result: true ); 8} },
+            { name: "Exit", key: :escape, key_name: 'esc', value: -> { self.interface_thread.kill;self.interface_thread.join;self.capture_thread.kill;exit 0 } }
           ]
 
-        # TODO: find a way to be able to hit 'q' or 'esc' to exit the menu (and the program).
         selected = 1
         loop do
-            selected = self.prompt.select( "Camera Capture", main_menu, enum: '.', per_page: 10, default: selected )
+            selected = self.prompt.select( "Camera Capture", main_menu, per_page: 10, default: selected, enum: '.', key_action: :select )
         end
     end
 
@@ -366,7 +366,7 @@ class CameraCapture
     # automatically create a 'slider' menu for a config (shutterspeed, apeture, etc..)
     # note: this isn't currently working, and is pending the next release (>0.22) of tty-prompt
     #
-    def menu_config_slider( configname, configtitle )
+    def menu_config_slider( configname, configtitle, &block )
         # get valid & current values
         values = self.command( 'getconfig', arg: '%s:choices' % [configname], wait_for_result: true ).first
         pretty_values = values
@@ -380,13 +380,13 @@ class CameraCapture
         end
 
         # add the "exit" option
-        choices << { name: "Exit", value: "Exit" }
+        choices << { name: "Exit", value: "Exit", key: :escape }
 
         loop do
             current = self.command( 'getconfig', arg: '%s:value' % [configname], wait_for_result: true ).first
             default = choices.find_index{|c| c[ :value ] == current } + 1
 
-            selected = self.prompt.slider( "Select %s." % [configtitle], choices, default: default )
+            selected = self.prompt.slider( "Select %s." % [configtitle], choices, default: default, show_help: 'always' )
             break if selected == "Exit"
 
             self.command( 'update', arg: '%s:%s' % [ configname, selected ] )
