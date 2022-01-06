@@ -1,9 +1,9 @@
 #!/usr/bin/env ruby
 require 'gphoto2'
 require 'rmagick'
+require 'optparse'
 require 'tty-prompt'
 require 'tty-spinner'
-require 'optparse'
 
 #
 class CameraCapture
@@ -27,6 +27,7 @@ class CameraCapture
         @output_geometry_aspect      = Rational( @output_geometry_width, @output_geometry_height )
         @output_geometry_keep_aspect = options.fetch( :output_geometry_keep_aspect ){ true }
         @wait_for_camera             = options.fetch( :wait_for_camera ){ false }
+        @capture_timeout             = options.fetch( :capture_timeout ){ 60*5 }
     end
 
 
@@ -61,6 +62,9 @@ class CameraCapture
     attr_accessor :capture_geometry_width
     attr_accessor :capture_geometry_height
     attr_accessor :capture_geometry_aspect
+
+    # the capture timeout, when nobody is using the capture
+    attr_accessor :capture_timeout
 
 
     # run the program
@@ -139,6 +143,7 @@ class CameraCapture
     #
     def run_interface_thread
         self.interface_thread = Thread.new do
+            @timing_out = nil
             loop do
                 unless self.capture_thread && self.capture_thread.alive?
                     # if the thread died with a message on the bus, make sure
@@ -153,6 +158,20 @@ class CameraCapture
                     # otherwise, just (re)start it.
                     self.capture_thread = Thread.new{ self.run_capture_thread }
                 end
+
+                # close the capture on timeout (nobody is streaming)
+                pids = IO.popen( ['lsof', '-w', '-Fp', self.output_device], "r", :err=>[:child, :out] ).readlines.delete_if{|x| x=='' } rescue []
+                if pids.count <= 1
+                    @timing_out ||= Time.now()
+                    if ( Time.now().to_i - @timing_out.to_i ) > self.capture_timeout
+                        print TTY::Cursor.clear_lines(10, :down)
+                        self.prompt.say 'Capture Timeout: No clients using stream for %s minutes.' % self.capture_timeout
+                        exit 4
+                    end
+                else
+                    @timing_out = nil
+                end
+
                 sleep 0.5
             end
         end
@@ -456,16 +475,23 @@ OptionParser.new do |opts|
         options[ :output_device ] = d
     end
 
-    opts.on( '-w', '--[no-]wait', "Wait for a camera to be connected. (default: no-wait)") do |w|
-        options[ :wait_for_camera ] = w
-    end
-
     opts.on( '-g', '--geometry=WxH', "Specify the output video geometry. (default: 1920x1280)") do |g|
         matches = /^(?<w>\d+)[xX:](?<h>\d+)$/.match( g )
-        raise ArgumentError, "Invalid geometry: %s" % [ g ] unless matches
+        raise ArgumentError, "Invalid geometry: %p" % [ g ] unless matches
 
         options[ :output_geometry_w ] = matches[ :w ]
         options[ :output_geometry_h ] = matches[ :h ]
+    end
+
+    opts.on( '-tMINUTES', '--timeout=minutes', "Automatically stop the capture if no client(s) are consuming the stream after MINUTES. (default: 5)") do |m|
+        matches = /^\d+$/.match(m)
+        raise ArgumentError, "Invalid timeout: %p" % [ m ] unless matches
+
+        options[ :capture_timeout ] = ( m.to_i * 60 )
+    end
+
+    opts.on( '-w', '--[no-]wait', "Wait for a camera to be connected. (default: no-wait)") do |w|
+        options[ :wait_for_camera ] = w
     end
 
     opts.on( '--[no-]keep-aspect-ratio', "Perserve the aspect ratio of the captured video in the output stream. (default: true)" ) do |k|
