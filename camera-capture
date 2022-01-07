@@ -165,7 +165,7 @@ class CameraCapture
                     @timing_out ||= Time.now()
                     if ( Time.now().to_i - @timing_out.to_i ) > self.capture_timeout
                         print TTY::Cursor.clear_lines(10, :down)
-                        self.prompt.say 'Capture Timeout: No clients using stream for %s minutes.' % self.capture_timeout
+                        self.prompt.say 'Capture Timeout: No clients using stream for %s minutes.' % [ self.capture_timeout / 60 ]
                         exit 4
                     end
                 else
