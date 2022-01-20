@@ -119,16 +119,28 @@ class CameraCapture
                 spinner.stop
             else
                 choices = cameras.each_with_object( {} ) do |c,acc|
-                        acc.merge!({ c['cameramodel'] => c })
+                        deets = c rescue nil
+                        model = deets['cameramodel'] rescue nil
+                        next unless model && deets
+                        acc.merge!({ model => deets })
                     end
-                choices.merge!( { "Exit" => "exit" } )
+                
                 spinner.stop
 
-                self.selected_camera = self.prompt.select(
-                    "Which camera?",
-                    choices
-                )
-                exit 0 if self.selected_camera == "exit"
+                # if one (or more) of the choices were invalid, and left us with only one
+                # choice, just choose that one. this filters out "USB Mass Storage Camera"
+                if choices.length == 1
+                    self.selected_camera = choices.first.last
+                    self.selected_camera.reload
+                else
+                    choices.merge!( { "Exit" => "exit" } )
+
+                    self.selected_camera = self.prompt.select(
+                        "Which camera?",
+                        choices
+                    )
+                    exit 0 if self.selected_camera == "exit"
+                end
             end
         }.join
     end
