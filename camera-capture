@@ -1,17 +1,35 @@
 #!/usr/bin/env ruby
+require 'yaml'
 require 'gphoto2'
 require 'rmagick'
 require 'optparse'
+require 'pathname'
 require 'tty-prompt'
 require 'tty-spinner'
 
-class NoCameraError < StandardError; end
-
+# Main Camera Capture App Class
 #
 class CameraCapture
 
+    # Specific error when no camera exists.
+    class NoCameraError < StandardError; end
+
     # the default v4l2 output device, written to by ffmpeg.
     DEFAULT_OUTPUT_DEVICE='/dev/video9'
+
+    # the default config location
+    DEFAULT_CONFIG_LOCATION=Pathname( '%s/.config/camera-capture.yml' % [ ENV[ 'HOME' ] ] )
+
+    # default config
+    DEFAULT_CONFIG = {
+        output_device:               DEFAULT_OUTPUT_DEVICE,
+        output_geometry_width:       1920,
+        output_geometry_height:      1280,
+        output_geometry_aspect:      Rational( 1920, 1280 ),
+        output_geometry_keep_aspect: true,
+        wait_for_camera:             false,
+        capture_timeout:             60*5
+    }
 
 
     # Initialize the app
@@ -22,14 +40,7 @@ class CameraCapture
         @command_queue = Queue.new
         @result_queue = Queue.new
 
-        # commandline args
-        @output_device               = options.fetch( :output_device ){ DEFAULT_OUTPUT_DEVICE }
-        @output_geometry_width       = options.fetch( :output_geometry_w ){ 1920 }
-        @output_geometry_height      = options.fetch( :output_geometry_h ){ 1280 }
-        @output_geometry_aspect      = Rational( @output_geometry_width, @output_geometry_height )
-        @output_geometry_keep_aspect = options.fetch( :output_geometry_keep_aspect ){ true }
-        @wait_for_camera             = options.fetch( :wait_for_camera ){ false }
-        @capture_timeout             = options.fetch( :capture_timeout ){ 60*5 }
+        self.load_config( options )
     end
 
 
@@ -51,22 +62,13 @@ class CameraCapture
     # the queue for getting data out of the capture thread
     attr_accessor :result_queue
 
-    # the selected v4l2 output device
-    attr_accessor :output_device
-
-    # the desired video output geometry
-    attr_accessor :output_geometry_width
-    attr_accessor :output_geometry_height
-    attr_accessor :output_geometry_aspect
-    attr_accessor :output_geometry_keep_aspect
+    # the config hash
+    attr_accessor :config
 
     # the captured video geometry
     attr_accessor :capture_geometry_width
     attr_accessor :capture_geometry_height
     attr_accessor :capture_geometry_aspect
-
-    # the capture timeout, when nobody is using the capture
-    attr_accessor :capture_timeout
 
 
     # run the program
@@ -82,6 +84,34 @@ class CameraCapture
     #########
     protected
     #########
+
+    # load/update the default configuration from commandline args and
+    # configuration parameters
+    #
+    def load_config( options )
+        # attempt to open the config file, if it exists
+        fl = options[ :config ] || DEFAULT_CONFIG_LOCATION
+        fc = fl.read rescue nil
+        begin
+            yaml = YAML.load( fc )
+            yaml.transform_keys!{|k| k.to_sym }
+        rescue => e
+            self.prompt.warn "Config parse error:"
+            self.prompt.say e.message
+            yaml = {}
+        end
+
+        # iterate through all valid config options, favoring cmdline options over config file,
+        # and defaulting to the defaults set in the hash at the beginning of the class.
+        @config = DEFAULT_CONFIG
+        @config.each do |k, _v|
+            next if k == :output_geometry_aspect
+            @config[ k ] = options[ k ] || yaml[ k ] || @config[ k ]
+        end
+
+        # calculated values
+        @config[ :output_geometry_aspect ] = Rational( @config[ :output_geometry_width ], @config[ :output_geometry_height ] )
+    end
 
 
     ##############################################
@@ -100,7 +130,7 @@ class CameraCapture
             cameras = GPhoto2::Camera.all
 
             # wait for a camera, if requested
-            if @wait_for_camera && cameras.empty?
+            if self.config[ :wait_for_camera ] && cameras.empty?
                 spinner.update( title: "Waiting for a camera.." )
 
                 loop do
@@ -183,12 +213,12 @@ class CameraCapture
                 end
 
                 # close the capture on timeout (nobody is streaming)
-                pids = IO.popen( ['lsof', '-w', '-Fp', self.output_device], "r", :err=>[:child, :out] ).readlines.delete_if{|x| x=='' } rescue []
+                pids = IO.popen( ['lsof', '-w', '-Fp', self.config[ :output_device ]], "r", :err=>[:child, :out] ).readlines.delete_if{|x| x=='' } rescue []
                 if pids.count <= 1
                     @timing_out ||= Time.now()
-                    if ( Time.now().to_i - @timing_out.to_i ) > self.capture_timeout
+                    if ( Time.now().to_i - @timing_out.to_i ) > self.config[ :capture_timeout ]
                         print TTY::Cursor.clear_lines(10, :down)
-                        self.prompt.say 'Capture Timeout: No clients using stream for %s minutes.' % [ self.capture_timeout / 60 ]
+                        self.prompt.say 'Capture Timeout: No clients using stream for %s minutes.' % [ self.config[ :capture_timeout ] / 60 ]
                         exit 4
                     end
                 else
@@ -286,7 +316,7 @@ class CameraCapture
     # make sure the v4l2 device is loaded
     #
     def check_v4l2
-        unless File.exist?( self.output_device )
+        unless File.exist?( self.config[ :output_device ] )
             puts "No such file: %s - is v4l2loopback loaded?"
             exit 1
         end
@@ -298,12 +328,12 @@ class CameraCapture
     #
     def ffmpeg_cmdline
         return "ffmpeg -hide_banner -loglevel quiet -i - -vcodec rawvideo -pix_fmt yuv420p -vf scale=w=%s:h=%s%s -threads 0 -f v4l2 %s" % [
-                self.output_geometry_width,
-                self.output_geometry_height,
-                ( self.output_geometry_keep_aspect && self.output_geometry_aspect != self.capture_geometry_aspect ?
-                    ( self.output_geometry_aspect > self.capture_geometry_aspect ? ':force_original_aspect_ratio=increase' : ':force_original_aspect_ratio=decrease' ) : ''
+                self.config[ :output_geometry_width ],
+                self.config[ :output_geometry_height ],
+                ( self.config[ :output_geometry_keep_aspect ] && self.config[ :output_geometry_aspect ] != self.capture_geometry_aspect ?
+                    ( self.config[ :output_geometry_aspect ] > self.capture_geometry_aspect ? ':force_original_aspect_ratio=increase' : ':force_original_aspect_ratio=decrease' ) : ''
                 ),
-                self.output_device
+                self.config[ :output_device ]
             ]
     end
 
@@ -493,6 +523,10 @@ end
 options = {}
 OptionParser.new do |opts|
     opts.banner = "Usage: #{ARGV[0]} [options]"
+
+    opts.on( '-cCONFIG', '--config=CONFIG', "The location of the camera-capture config file. (default: ~/.config/camera-capture.yml)") do |c|
+        options[ :config ] = Pathname( c )
+    end
 
     opts.on( '-dDEVICE', '--device=DEVICE', "The v4l2 device to output to. (default: video9)") do |d|
         options[ :output_device ] = d

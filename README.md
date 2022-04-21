@@ -34,8 +34,30 @@ Currently, you can:
 - Send arbitrary gphoto2 configs
 - Restart the capture
 
+## Configuration
 
-Known bugs:
+Configuration is stored in `~/.config/camera-capture.yml`, or a file provided by `-c` or `--config`. The following keys are available:
+
+`output_device`:
+    String: Path to the output v4l2loopback device (or whatever you're using).
+
+`output_geometry_width`:
+    Int: Output width, in pixels.
+
+`output_geometry_height`:
+    Int: Output height, in pixels.
+
+`output_geometry_keep_aspect`:
+    Boolean: Should camera-capture keep the output aspect ratio?
+
+`wait_for_camera`:
+    Boolean: Should camera-capture wait for your camera to appear?
+
+`capture_timeout`:
+    Int: How long to keep capturing without any clients before disconnecting from the camera.
+
+
+## Known bugs
 
 - Autofocus. At least with my camera, it usually only ever focuses once. Attempting to 'cancel' and then
   re-focus has rarely, if ever, worked for me.
@@ -63,5 +85,7 @@ Known bugs:
   - [ ] change output format
   - [ ] sub-menu for ffmpeg status/options
 - [ ] Ability to mess with the video feed (add filters, frames, rotate...)
-- [ ] Configuration saving/restoring
+- [-] Configuration
+  - [x] File
+  - [ ] Saving/Restoring
 
