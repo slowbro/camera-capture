@@ -1,0 +1,21 @@
+---
+# test the output device name, full path
+# output_device: /dev/video9
+
+# the output width requesred
+# output_geometry_width: 1920
+
+# the output height requested
+# output_geometry_height: 1080
+
+# before scaling, should we crop the output geometry to the aspect requested?
+# output_geometry_crop: false
+
+# when scaling, should we try to keep the original aspect?
+# output_geometry_keep_aspect: true
+
+# should camera-capture wait indefinitely for a camera to connect?
+# wait_for_camera: false
+
+# how long camera-capture should wait when nobody is consuming its output before shuhttindg down
+# capture_timeout: 300

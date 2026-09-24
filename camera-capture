@@ -27,6 +27,7 @@ class CameraCapture
         output_geometry_height:      1280,
         output_geometry_aspect:      Rational( 1920, 1280 ),
         output_geometry_keep_aspect: true,
+        output_geometry_crop:        false,
         wait_for_camera:             false,
         capture_timeout:             60*5
     }
@@ -106,7 +107,12 @@ class CameraCapture
         @config = DEFAULT_CONFIG
         @config.each do |k, _v|
             next if k == :output_geometry_aspect
-            @config[ k ] = options[ k ] || yaml[ k ] || @config[ k ]
+            @config[ k ] = options.include?( k ) ?
+                            options[ k ] :
+                            ( yaml.include?( k ) ?
+                                yaml[ k ] :
+                                @config[ k ]
+                            )
         end
 
         # calculated values
@@ -241,7 +247,7 @@ class CameraCapture
         self.capture_geometry_height = image.rows
         self.capture_geometry_aspect = Rational( image.columns, image.rows )
 
-        io = IO.popen( self.ffmpeg_cmdline, "w" ) do |ffmpeg_io|
+        io = IO.popen( self.ffmpeg_cmdline , "w") do |ffmpeg_io|
             loop do
                 # read a preview image and send it off to ffmpeg
                 ffmpeg_io.write( self.selected_camera.preview.data )
@@ -327,11 +333,18 @@ class CameraCapture
     # TODO: flesh out the ffmpeg customization.
     #
     def ffmpeg_cmdline
-        return "ffmpeg -hide_banner -loglevel quiet -i - -vcodec rawvideo -pix_fmt yuv420p -vf scale=w=%s:h=%s%s -threads 0 -f v4l2 %s" % [
+        w_base = self.capture_geometry_width / self.config[ :output_geometry_aspect ].numerator
+        h = w_base * self.config[ :output_geometry_aspect ].denominator
+        return "ffmpeg -hide_banner -loglevel quiet -i - -vcodec rawvideo -pix_fmt yuv420p -vf %sscale=w=%s:h=%s%s -threads 0 -f v4l2 %s" % [
+                ( self.config[ :output_geometry_crop ] ?
+                    'crop=%s:%s,' % [ self.capture_geometry_width, h ] :
+                    ''
+                ),
                 self.config[ :output_geometry_width ],
                 self.config[ :output_geometry_height ],
-                ( self.config[ :output_geometry_keep_aspect ] && self.config[ :output_geometry_aspect ] != self.capture_geometry_aspect ?
-                    ( self.config[ :output_geometry_aspect ] > self.capture_geometry_aspect ? ':force_original_aspect_ratio=increase' : ':force_original_aspect_ratio=decrease' ) : ''
+                ( !self.config[ :output_geometry_crop ] && self.config[ :output_geometry_keep_aspect ] && self.config[ :output_geometry_aspect ] != self.capture_geometry_aspect ?
+                    ( self.config[ :output_geometry_aspect ] > self.capture_geometry_aspect ? ':force_original_aspect_ratio=increase' : ':force_original_aspect_ratio=decrease' ) :
+                    ''
                 ),
                 self.config[ :output_device ]
             ]
@@ -547,11 +560,15 @@ OptionParser.new do |opts|
         options[ :capture_timeout ] = ( m.to_i * 60 )
     end
 
-    opts.on( '-w', '--[no-]wait', "Wait for a camera to be connected. (default: no-wait)") do |w|
+    opts.on( '-w', '--[no-]wait', "Wait for a camera to be connected. (default: no-wait)" ) do |w|
         options[ :wait_for_camera ] = w
     end
 
-    opts.on( '--[no-]keep-aspect-ratio', "Perserve the aspect ratio of the captured video in the output stream. (default: true)" ) do |k|
+    opts.on( '-c', '--[no-]crop', "Crop the output to -g/--geometry instead of scaling/stretching. (default: false)" ) do |k|
+        options[ :output_geometry_crop ] = k
+    end
+
+    opts.on( '--[no-]keep-aspect-ratio', "Perserve the aspect ratio of the captured video in the output stream, when not cropping. (default: true)" ) do |k|
         options[ :output_geometry_keep_aspect ] = k
     end
 
