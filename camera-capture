@@ -317,7 +317,7 @@ class CameraCapture
     #
     def check_v4l2
         unless File.exist?( self.config[ :output_device ] )
-            puts "No such file: %s - is v4l2loopback loaded?"
+            puts "No such file: %s - is v4l2loopback loaded?" % [ self.config[ :output_device ] ]
             exit 1
         end
     end
