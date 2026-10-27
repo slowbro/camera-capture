@@ -71,6 +71,9 @@ class CameraCapture
     attr_accessor :capture_geometry_height
     attr_accessor :capture_geometry_aspect
 
+    # the displayed help message
+    attr_accessor :help_message
+
 
     # run the program
     #
@@ -289,6 +292,13 @@ class CameraCapture
                         node,value = data.split(":")
                         self.selected_camera.update( node.to_sym => value ) rescue nil
 
+                    when 'snapshot'
+                        fn = "%s_camera_caputre.jpg" % [ Time.now.strftime( "%F-%H%M%S" ) ]
+                        fh = File.open( "%s" % [ fn ], 'w+' )
+                        fh.write( self.selected_camera.preview.data )
+                        fh.close
+                        self.help_message = "Saved snapshot as %s!" % [ fn ]
+
                     when 'exit'
                         self.result_queue.push [ 'bye' ]
                         break
@@ -401,19 +411,20 @@ class CameraCapture
                 } },
             { name: "Adjust Shutter Speed", key: 's', value: -> { self.menu_config_slider( 'shutterspeed', 'a shutter speed.' ); 5 } },
             { name: "Adjust ISO", key: 'i', value: -> { self.menu_config_slider( 'iso', 'an ISO.' ); 6 } },
+            { name: "Save Snapshot to File", key: 'S', value: -> { self.menu_save_snapshot; 7 } },
             { name: "Send gphoto2 config", key: 'g', value: Proc.new{
                     cmd = self.prompt.ask "Enter a gphoto2 config like \"node_name:value\". Enter an empty line to cancel.\n>"
                     self.command( 'update', arg: cmd ) if cmd
-                    7
+                    8
                 }
             },
-            { name: "Restart capture", key: "r", value: -> { self.command( 'exit', wait_for_result: true ); 8} },
+            { name: "Restart capture", key: "r", value: -> { self.command( 'exit', wait_for_result: true ); 9} },
             { name: "Exit", key: :escape, key_name: 'esc', value: -> { self.interface_thread.kill;self.interface_thread.join;self.capture_thread.kill;exit 0 } }
           ]
 
         selected = 1
         loop do
-            selected = self.prompt.select( "Camera Capture", main_menu, per_page: 10, default: selected, enum: '.', key_action: :select )
+            selected = self.prompt.select( "Camera Capture", main_menu, per_page: 10, default: selected, enum: '.', key_action: :select, show_help: :always, help: self.help_message )
         end
     end
 
@@ -527,6 +538,13 @@ class CameraCapture
             self.command( 'manualfocusdrive', arg: selected )
             last_selection = selected
         end
+    end
+
+    # save the current frame to a file
+    #
+    def menu_save_snapshot
+        self.command( 'snapshot' )
+        sleep 0.25
     end
 
 end
